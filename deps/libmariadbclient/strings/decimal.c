@@ -1170,7 +1170,7 @@ int decimal2longlong(const decimal_t *from, longlong *to)
 
     And for -1234567890.1234 it would be
 
-                7E F2 04 37 2D FB 2D
+                7E F2 04 C7 2D FB 2D
 */
 int decimal2bin(const decimal_t *from, uchar *to, int precision, int frac)
 {
@@ -1445,7 +1445,9 @@ int decimal_bin_size(int precision, int scale)
       intg0=intg/DIG_PER_DEC1, frac0=scale/DIG_PER_DEC1,
       intg0x=intg-intg0*DIG_PER_DEC1, frac0x=scale-frac0*DIG_PER_DEC1;
 
-  DBUG_ASSERT(scale >= 0 && precision > 0 && scale <= precision);
+  DBUG_ASSERT(scale >= 0);
+  DBUG_ASSERT(precision > 0);
+  DBUG_ASSERT(scale <= precision);
   return intg0*sizeof(dec1)+dig2bytes[intg0x]+
          frac0*sizeof(dec1)+dig2bytes[frac0x];
 }
