@@ -30,6 +30,7 @@ static Persistent<String> cfg_user_symbol;
 static Persistent<String> cfg_pwd_symbol;
 static Persistent<String> cfg_host_symbol;
 static Persistent<String> cfg_port_symbol;
+static Persistent<String> cfg_socket_symbol;
 static Persistent<String> cfg_db_symbol;
 static Persistent<String> cfg_timeout_symbol;
 static Persistent<String> cfg_secauth_symbol;
@@ -95,6 +96,7 @@ struct sql_config {
   char *password;
   char *ip;
   char *db;
+  char *socket;
   unsigned int port;
   unsigned long client_opts;
 
@@ -184,6 +186,7 @@ class Client : public ObjectWrap {
       config.password = NULL;
       config.ip = NULL;
       config.db = NULL;
+      config.socket = NULL;
       config.client_opts = CLIENT_MULTI_RESULTS | CLIENT_REMEMBER_OPTIONS;
       config.ssl_key = NULL;
       config.ssl_cert = NULL;
@@ -217,6 +220,7 @@ class Client : public ObjectWrap {
       FREE(config.user);
       FREE(config.password);
       FREE(config.ip);
+      FREE(config.socket);
       FREE(config.db);
       FREE(config.ssl_key);
       FREE(config.ssl_cert);
@@ -291,22 +295,27 @@ class Client : public ObjectWrap {
       while (!done) {
         switch (state) {
           case STATE_CONNECT:
-            status = mysql_real_connect_start(&mysql_ret, &mysql,
+            status = mysql_real_connect_start(&mysql_ret,
+                                              &mysql,
                                               config.ip,
                                               config.user,
                                               config.password,
                                               config.db,
                                               config.port,
-                                              NULL,
+                                              config.socket,
                                               config.client_opts);
             if (!mysql_ret && mysql_errno(&mysql) > 0)
               return emit_error(err_symbol, true);
+
             mysql_sock = mysql_get_socket(&mysql);
+
             poll_handle = (uv_poll_t*) malloc(sizeof(uv_poll_t));
-            uv_poll_init_socket(uv_default_loop(), poll_handle,
+            uv_poll_init_socket(uv_default_loop(),
+                                poll_handle,
                                 mysql_sock);
             uv_poll_start(poll_handle, UV_READABLE, cb_poll);
             poll_handle->data = this;
+
             if (status) {
               done = true;
               state = STATE_CONNECTING;
@@ -317,6 +326,7 @@ class Client : public ObjectWrap {
             break;
           case STATE_CONNECTING:
             status = mysql_real_connect_cont(&mysql_ret, &mysql, event);
+
             if (status)
               done = true;
             else {
@@ -335,7 +345,8 @@ class Client : public ObjectWrap {
               state = STATE_ABORT;
             } else {
               had_error = false;
-              status = mysql_real_query_start(&cur_query.err, &mysql,
+              status = mysql_real_query_start(&cur_query.err,
+                                              &mysql,
                                               cur_query.str,
                                               strlen(cur_query.str));
               if (status) {
@@ -355,7 +366,8 @@ class Client : public ObjectWrap {
             }
             break;
           case STATE_QUERYING:
-            status = mysql_real_query_cont(&cur_query.err, &mysql,
+            status = mysql_real_query_cont(&cur_query.err,
+                                           &mysql,
                                            mysql_status(event));
             if (status)
               done = true;
@@ -398,16 +410,13 @@ class Client : public ObjectWrap {
             }
             break;
           case STATE_ROWSTREAMING:
-            if (cur_query.abort)
-              state = STATE_ABORT;
-            else {
-              status = mysql_fetch_row_cont(&cur_query.row, cur_query.result,
-                                            mysql_status(event));
-              if (status)
-                done = true;
-              else
-                state = STATE_ROWSTREAMED;
-            }
+            status = mysql_fetch_row_cont(&cur_query.row,
+                                          cur_query.result,
+                                          mysql_status(event));
+            if (status)
+              done = true;
+            else
+              state = STATE_ROWSTREAMED;
             break;
           case STATE_ROWSTREAMED:
             if (cur_query.abort)
@@ -462,7 +471,8 @@ class Client : public ObjectWrap {
             }
             break;
           case STATE_NEXTQUERYING:
-            status = mysql_next_result_cont(&cur_query.err, &mysql,
+            status = mysql_next_result_cont(&cur_query.err,
+                                            &mysql,
                                             mysql_status(event));
             if (status)
               done = true;
@@ -554,7 +564,10 @@ class Client : public ObjectWrap {
       if (status != 0 && uv_last_error(uv_default_loop()).code == EBADF
           && obj->state == STATE_CONNECTING) {
         std::string errmsg("Can't connect to MySQL server on '");
-        errmsg += obj->config.ip;
+        if (obj->config.socket)
+          errmsg += obj->config.socket;
+        else
+          errmsg += obj->config.ip;
         errmsg += "' (0)";
         obj->emit_error(err_symbol, true, 2003, errmsg.c_str());
         return;
@@ -665,11 +678,12 @@ class Client : public ObjectWrap {
           for (i = 0; i < vlen; ++i)
             new_buf[i] = buf[i];
           field_value = String::New(new_buf, vlen);
-          delete new_buf;
+          delete[] new_buf;
         } else if (IS_NUM(fields[f].type) && fields[f].type != MYSQL_TYPE_LONGLONG)
           field_value = Number::New(atof(cur_query.row[f]));
-         else
+        } else
           field_value = String::New(cur_query.row[f], lengths[f]);
+
         if (cur_query.use_array)
           row->Set(f, field_value);
         else
@@ -745,6 +759,7 @@ class Client : public ObjectWrap {
       Local<Value> password_v = cfg->Get(cfg_pwd_symbol);
       Local<Value> ip_v = cfg->Get(cfg_host_symbol);
       Local<Value> port_v = cfg->Get(cfg_port_symbol);
+      Local<Value> socket_v = cfg->Get(cfg_socket_symbol);
       Local<Value> db_v = cfg->Get(cfg_db_symbol);
       Local<Value> timeout_v = cfg->Get(cfg_timeout_symbol);
       Local<Value> secauth_v = cfg->Get(cfg_secauth_symbol);
@@ -771,6 +786,13 @@ class Client : public ObjectWrap {
       else {
         String::Utf8Value ip_s(ip_v);
         obj->config.ip = strdup(*ip_s);
+      }
+
+      if (!socket_v->IsString() || socket_v->ToString()->Length() == 0)
+        obj->config.socket = NULL;
+      else {
+        String::Utf8Value socket_s(socket_v);
+        obj->config.socket = strdup(*socket_s);
       }
 
       if (!port_v->IsUint32() || port_v->Uint32Value() == 0)
@@ -939,6 +961,7 @@ class Client : public ObjectWrap {
       cfg_pwd_symbol = NODE_PSYMBOL("password");
       cfg_host_symbol = NODE_PSYMBOL("host");
       cfg_port_symbol = NODE_PSYMBOL("port");
+      cfg_socket_symbol = NODE_PSYMBOL("unixSocket");
       cfg_db_symbol = NODE_PSYMBOL("db");
       cfg_timeout_symbol = NODE_PSYMBOL("connTimeout");
       cfg_secauth_symbol = NODE_PSYMBOL("secureAuth");
