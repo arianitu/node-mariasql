@@ -44,6 +44,10 @@ static Persistent<String> cfg_ssl_ca_symbol;
 static Persistent<String> cfg_ssl_capath_symbol;
 static Persistent<String> cfg_ssl_cipher_symbol;
 static Persistent<String> cfg_ssl_reject_symbol;
+static Persistent<String> cfg_local_infile_symbol;
+static Persistent<String> cfg_read_default_file;
+static Persistent<String> cfg_read_default_group;
+static Persistent<String> cfg_charset_symbol;
 
 const int STATE_NULL = -100,
           STATE_CLOSE = -2,
@@ -108,12 +112,14 @@ struct sql_config {
   char *ssl_ca;
   char *ssl_capath;
   char *ssl_cipher;
+  char *charset;
 };
 
 struct sql_query {
   MYSQL_RES *result;
   MYSQL_ROW row;
   Persistent<String> *column_names;
+  unsigned int column_count;
   int err;
   char *str;
   bool use_array;
@@ -145,10 +151,9 @@ const my_bool MY_BOOL_TRUE = 1,
 
 #define FREE(p) if (p) { free(p); p = NULL; }
 #define FREE_PERSIST(h) if (!h.IsEmpty()) { h.Dispose(); h.Clear(); }
-#define FREE_PERSISTARRAY(a,t) \
+#define FREE_PERSISTARRAY(a,len) \
           if (a) {                                                            \
-            for (unsigned int i = 0, len = sizeof(a) / sizeof(Persistent<t>); \
-                 i < len; ++i)                                                \
+            for (unsigned int i = 0; i < len; ++i)                            \
               FREE_PERSIST(a[i]);                                             \
             FREE(a);                                                          \
             a = NULL;                                                         \
@@ -196,12 +201,14 @@ class Client : public ObjectWrap {
       config.ssl_ca = NULL;
       config.ssl_capath = NULL;
       config.ssl_cipher = NULL;
+      config.charset = NULL;
       had_error = destructing = false;
       deferred_state = STATE_NULL;
       poll_handle = NULL;
 
       cur_query.result = NULL;
       cur_query.column_names = NULL;
+      cur_query.column_count = 0;
       cur_query.err = 0;
       cur_query.str = NULL;
       cur_query.use_array = false;
@@ -230,9 +237,11 @@ class Client : public ObjectWrap {
       FREE(config.ssl_ca);
       FREE(config.ssl_capath);
       FREE(config.ssl_cipher);
+      FREE(config.charset);
 
       FREE(cur_query.result);
-      FREE_PERSISTARRAY(cur_query.column_names, String);
+      FREE_PERSISTARRAY(cur_query.column_names, cur_query.column_count);
+      cur_query.column_count = 0;
       cur_query.err = 0;
       FREE(cur_query.str);
       cur_query.use_array = false;
@@ -439,7 +448,7 @@ class Client : public ObjectWrap {
                 mysql_free_result(cur_query.result);
                 cur_query.result = NULL;
                 state = STATE_NEXTQUERY;
-                FREE_PERSISTARRAY(cur_query.column_names, String);
+                FREE_PERSISTARRAY(cur_query.column_names, cur_query.column_count);
                 emit_done(insert_id, affected_rows, num_rows);
               }
             }
@@ -536,7 +545,7 @@ class Client : public ObjectWrap {
           case STATE_RESULTFREED:
             state = STATE_CONNECTED;
             cur_query.result = NULL;
-            FREE_PERSISTARRAY(cur_query.column_names, String);
+            FREE_PERSISTARRAY(cur_query.column_names, cur_query.column_count);
             if (deferred_state != STATE_NULL) {
               state = deferred_state;
               deferred_state = STATE_NULL;
@@ -650,7 +659,7 @@ class Client : public ObjectWrap {
       uint16_t *new_buf;
       unsigned long *lengths;
       Handle<Value> field_value;
-      Local<Object> row, metadata, types, charsetNrs;
+      Local<Object> row, metadata, types, charsetNrs, dbs, tables, orgTables, names, orgNames;
 
       if (n_fields == 0)
         return;
@@ -661,12 +670,18 @@ class Client : public ObjectWrap {
         if (config.metadata) {
           types = Array::New(n_fields);
           charsetNrs = Array::New(n_fields);
+          dbs = Array::New(n_fields);
+          tables = Array::New(n_fields);
+          orgTables = Array::New(n_fields);
+          names = Array::New(n_fields);
+          orgNames = Array::New(n_fields);
         }
       }
       else {
         if (!cur_query.column_names) {
           cur_query.column_names =
             (Persistent<String>*) malloc(sizeof(Persistent<String>) * n_fields);
+          cur_query.column_count = n_fields;
           for (f = 0; f < n_fields; ++f) {
             field = fields[f];
             cur_query.column_names[f] = Persistent<String>::New(
@@ -679,6 +694,11 @@ class Client : public ObjectWrap {
         if (config.metadata) {
           types = Object::New();
           charsetNrs = Object::New();
+          dbs = Object::New();
+          tables = Object::New();
+          orgTables = Object::New();
+          names = Object::New();
+          orgNames = Object::New();
         }
       }
       for (f = 0; f < n_fields; ++f) {
@@ -706,20 +726,35 @@ class Client : public ObjectWrap {
           field = fields[f];
           if (cur_query.use_array) {
             types->Set(f, String::New(FieldTypeToString(field.type)));
-            charsetNrs->Set(f, Integer::NewFromUnsigned(field.charsetnr));
+            charsetNrs->Set(f, Integer::NewFromUnsigned(field.charsetnr));            
+            dbs->Set(f, String::New(field.db));
+            tables->Set(f, String::New(field.table));
+            orgTables->Set(f, String::New(field.org_table));
+            names->Set(f, String::New(field.name));
+            orgNames->Set(f, String::New(field.org_name));
           }
           else {
-            types->Set(cur_query.column_names[f], String::New(FieldTypeToString(field.type)));   
-            charsetNrs->Set(cur_query.column_names[f], Integer::NewFromUnsigned(field.charsetnr));
+            types->Set(cur_query.column_names[f], String::New(FieldTypeToString(field.type)));
+            charsetNrs->Set(cur_query.column_names[f], Integer::NewFromUnsigned(field.charsetnr));            
+            dbs->Set(cur_query.column_names[f], String::New(field.db));
+            tables->Set(cur_query.column_names[f], String::New(field.table));
+            orgTables->Set(cur_query.column_names[f], String::New(field.org_table));
+            names->Set(cur_query.column_names[f], String::New(field.name));
+            orgNames->Set(cur_query.column_names[f], String::New(field.org_name));
           }
         }
       }
-      
+
       TryCatch try_catch;
       if (config.metadata) {
         metadata = Object::New();
         metadata->Set(String::New("types"), types);
         metadata->Set(String::New("charsetNrs"), charsetNrs);
+        metadata->Set(String::New("dbs"), dbs);
+        metadata->Set(String::New("tables"), tables);
+        metadata->Set(String::New("orgTables"), orgTables);
+        metadata->Set(String::New("names"), names);
+        metadata->Set(String::New("orgNames"), orgNames);
 
         Handle<Value> emit_argv[3] = { qrow_symbol, row, metadata };
         Emit->Call(handle_, 3, emit_argv);
@@ -727,7 +762,7 @@ class Client : public ObjectWrap {
         Handle<Value> emit_argv[2] = { qrow_symbol, row };
         Emit->Call(handle_, 2, emit_argv);
       }
-      
+
       if (try_catch.HasCaught())
         FatalException(try_catch);
     }
@@ -839,7 +874,11 @@ class Client : public ObjectWrap {
       Local<Value> compress_v = cfg->Get(cfg_compress_symbol);
       Local<Value> ssl_v = cfg->Get(cfg_ssl_symbol);
       Local<Value> metadata_v = cfg->Get(cfg_metadata_symbol);
-
+      Local<Value> local_infile_v = cfg->Get(cfg_local_infile_symbol);
+      Local<Value> default_file_v = cfg->Get(cfg_read_default_file);
+      Local<Value> default_group_v = cfg->Get(cfg_read_default_group);
+      Local<Value> charset_v = cfg->Get(cfg_charset_symbol);
+      
       if (!user_v->IsString() || user_v->ToString()->Length() == 0)
         obj->config.user = NULL;
       else {
@@ -882,6 +921,18 @@ class Client : public ObjectWrap {
       if (timeout_v->IsUint32() && timeout_v->Uint32Value() > 0)
         timeout = timeout_v->Uint32Value();
       mysql_options(&obj->mysql, MYSQL_OPT_CONNECT_TIMEOUT, &timeout);
+
+      if (local_infile_v->IsBoolean() && local_infile_v->BooleanValue()){
+        mysql_options(&obj->mysql, MYSQL_OPT_LOCAL_INFILE, &MY_BOOL_TRUE);
+      }
+
+      if (default_file_v->IsString() && default_file_v->ToString()->Length() > 0) {
+        mysql_options(&obj->mysql, MYSQL_READ_DEFAULT_FILE, *String::Utf8Value(default_file_v));
+      } 
+
+      if (default_group_v->IsString() && default_group_v->ToString()->Length() > 0) {
+        mysql_options(&obj->mysql, MYSQL_READ_DEFAULT_GROUP, *String::Utf8Value(default_group_v));
+      }  
 
       if (!secauth_v->IsBoolean()
           || (secauth_v->IsBoolean() && secauth_v->BooleanValue()))
@@ -939,7 +990,11 @@ class Client : public ObjectWrap {
                       obj->config.ssl_capath,
                       obj->config.ssl_cipher);
       }
-
+      if (charset_v->IsString() && charset_v->ToString()->Length() > 0) {
+        obj->config.charset = strdup(*(String::Utf8Value(charset_v)));
+        mysql_options(&obj->mysql, MYSQL_SET_CHARSET_NAME, obj->config.charset); 
+      }
+      
       obj->connect();
 
       return Undefined();
@@ -1052,6 +1107,10 @@ class Client : public ObjectWrap {
       cfg_ssl_capath_symbol = NODE_PSYMBOL("capath");
       cfg_ssl_cipher_symbol = NODE_PSYMBOL("cipher");
       cfg_ssl_reject_symbol = NODE_PSYMBOL("rejectUnauthorized");
+      cfg_local_infile_symbol = NODE_PSYMBOL("local_infile");
+      cfg_read_default_file = NODE_PSYMBOL("read_default_file");
+      cfg_read_default_group = NODE_PSYMBOL("read_default_group");
+      cfg_charset_symbol = NODE_PSYMBOL("charset");
 
       target->Set(name, Client_constructor->GetFunction());
     }
